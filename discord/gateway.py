@@ -1010,12 +1010,17 @@ class DiscordVoiceWebSocket:
             self._connection.mode = data['mode']
             await self.load_secret_key(data)
             self._connection.dave_protocol_version = data['dave_protocol_version']
+            self._connection.dave_downgraded = data['dave_protocol_version'] == 0
             if data['dave_protocol_version'] > 0:
                 await self._connection.reinit_dave_session()
         elif op == self.HELLO:
             interval = data['heartbeat_interval'] / 1000.0
             self._keep_alive = VoiceKeepAliveHandler(ws=self, interval=min(interval, 5.0))
             self._keep_alive.start()
+        elif op == self.CLIENTS_CONNECT:
+            self._connection.connected_user_ids.update(int(user_id) for user_id in data['user_ids'])
+        elif op == self.CLIENT_DISCONNECT:
+            self._connection.connected_user_ids.discard(int(data['user_id']))
         elif self._connection.dave_session:
             state = self._connection
             if op == self.DAVE_PREPARE_TRANSITION:
@@ -1025,11 +1030,16 @@ class DiscordVoiceWebSocket:
                     data['protocol_version'],
                 )
                 state.dave_pending_transitions[data['transition_id']] = data['protocol_version']
+                try:
+                    state.dave_session.prepare_transition(data['transition_id'], data['protocol_version'])
+                except Exception:
+                    _log.exception('Failed to prepare DAVE transition id %d', data['transition_id'])
+
                 if data['transition_id'] == 0:
                     await state._execute_transition(data['transition_id'])
                 else:
-                    if data['protocol_version'] == 0 and state.dave_session:
-                        state.dave_session.set_passthrough_mode(True, 120)
+                    if data['protocol_version'] == 0:
+                        state.dave_session.set_passthrough_mode(True)
 
                     await self.send_transition_ready(data['transition_id'])
             elif op == self.DAVE_EXECUTE_TRANSITION:
@@ -1059,7 +1069,9 @@ class DiscordVoiceWebSocket:
         elif op == self.MLS_PROPOSALS:
             optype = msg[3]
             result = state.dave_session.process_proposals(
-                davey.ProposalsOperationType.append if optype == 0 else davey.ProposalsOperationType.revoke, msg[4:]
+                davey.ProposalsOperationType.append if optype == 0 else davey.ProposalsOperationType.revoke,
+                msg[4:],
+                [*state.connected_user_ids, state.user.id],
             )
             if isinstance(result, davey.CommitWelcome):
                 await self.send_binary(
@@ -1071,6 +1083,7 @@ class DiscordVoiceWebSocket:
             transition_id = struct.unpack_from('>H', msg, 3)[0]
             try:
                 state.dave_session.process_commit(msg[5:])
+                state.dave_session.prepare_transition(transition_id, state.dave_session.protocol_version)
                 if transition_id != 0:
                     state.dave_pending_transitions[transition_id] = state.dave_protocol_version
                     await self.send_transition_ready(transition_id)
@@ -1080,7 +1093,9 @@ class DiscordVoiceWebSocket:
         elif op == self.MLS_WELCOME:
             transition_id = struct.unpack_from('>H', msg, 3)[0]
             try:
-                state.dave_session.process_welcome(msg[5:])
+                # Welcome rosters include ourselves
+                state.dave_session.process_welcome(msg[5:], [*state.connected_user_ids, state.user.id])
+                state.dave_session.prepare_transition(transition_id, state.dave_session.protocol_version)
                 if transition_id != 0:
                     state.dave_pending_transitions[transition_id] = state.dave_protocol_version
                     await self.send_transition_ready(transition_id)
