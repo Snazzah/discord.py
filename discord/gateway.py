@@ -1082,7 +1082,9 @@ class DiscordVoiceWebSocket:
         elif op == self.MLS_ANNOUNCE_COMMIT_TRANSITION:
             transition_id = struct.unpack_from('>H', msg, 3)[0]
             try:
-                state.dave_session.process_commit(msg[5:])
+                if not state.dave_session.process_commit(msg[5:]):
+                    _log.debug('MLS commit ignored for transition id %d', transition_id)
+                    return
                 state.dave_session.prepare_transition(transition_id, state.dave_session.protocol_version)
                 if transition_id != 0:
                     state.dave_pending_transitions[transition_id] = state.dave_protocol_version
